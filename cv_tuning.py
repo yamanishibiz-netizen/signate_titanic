@@ -1,6 +1,163 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+# train / test がグローバルに無ければ csv または parquet を同ディレクトリから探す
+try:
+    train  # type: ignore
+    test   # type: ignore
+except NameError:
+    script_dir = Path(__file__).resolve().parent
+    def load_candidate(name_stems):
+        for stem in name_stems:
+            for ext in (".csv", ".parquet", ".pkl"):
+                p = script_dir / (stem + ext)
+                if p.exists():
+                    if ext == ".csv":
+                        return pd.read_csv(p)
+                    elif ext == ".parquet":
+                        return pd.read_parquet(p)
+                    else:
+                        return pd.read_pickle(p)
+        return None
+
+    train = load_candidate(["train", "train_data", "train_df"])
+    test = load_candidate(["test", "test_data", "test_df"])
+
+    if train is None or test is None:
+        raise RuntimeError(
+            "train/test が見つかりません。スクリプトの同ディレクトリに train.csv/test.csv などを置くか、"
+            "先に train/test DataFrame を定義してください。"
+        )
+
+# 残す特徴のみ選択
+core_features = [
+    "pclass","sex","age","sibsp","parch","fare",
+    "embarked_S","embarked_C","embarked_Q",
+    "family_size","fare_per_person","age_group"
+]
+
+def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # embarked one-hot (embarked_S, embarked_C, embarked_Q)
+    if "embarked" in df.columns:
+        d = pd.get_dummies(df["embarked"], prefix="embarked")
+        for col in ("embarked_S", "embarked_C", "embarked_Q"):
+            if col not in d.columns:
+                d[col] = 0
+        df = pd.concat([df, d[["embarked_S", "embarked_C", "embarked_Q"]]], axis=1)
+
+    # family_size = sibsp + parch + 1
+    if "family_size" not in df.columns and all(c in df.columns for c in ("sibsp", "parch")):
+        df["family_size"] = df["sibsp"].fillna(0) + df["parch"].fillna(0) + 1
+
+    # fare_per_person = fare / family_size (fallback to fare if family_size missing)
+    if "fare_per_person" not in df.columns and "fare" in df.columns:
+        if "family_size" in df.columns:
+            df["fare_per_person"] = df["fare"].fillna(0) / df["family_size"].clip(lower=1)
+        else:
+            df["fare_per_person"] = df["fare"].fillna(0)
+
+    # age_group: simple bucketing from age
+    if "age_group" not in df.columns and "age" in df.columns:
+        bins = [0, 12, 18, 35, 60, 120]
+        labels = ["child", "teen", "young_adult", "adult", "senior"]
+        df["age_group"] = pd.cut(df["age"].fillna(-1), bins=bins, labels=labels, include_lowest=True)
+        # convert to numeric codes so models won't choke on strings
+        df["age_group"] = df["age_group"].astype("category").cat.codes
+
+    # convert any remaining object dtype core features to categorical codes
+    for col in list(df.columns):
+        if col in core_features and df[col].dtype == object:
+            df[col] = df[col].astype('category').cat.codes
+
+    return df
+
+
+# try to create missing engineered features in both train/test when possible
+train = _ensure_features(train)
+test = _ensure_features(test)
+
+# choose only features that actually exist
+available_features = [f for f in core_features if f in train.columns]
+missing = [f for f in core_features if f not in train.columns]
+if missing:
+    print("Warning: following core features missing from train and will be skipped:", missing)
+
+X = train[available_features].copy()
+y = train["survived"].copy()
+X_test = test[available_features].copy() if all(f in test.columns for f in available_features) else None
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# 軽いグリッド（組み合わせは最小限）
+param_grid = [
+    {"learning_rate":0.03, "n_estimators":800, "num_leaves":31, "max_depth":5, "min_data_in_leaf":25, "lambda_l2":0.2},
+    {"learning_rate":0.01, "n_estimators":1200, "num_leaves":15, "max_depth":5, "min_data_in_leaf":30, "lambda_l2":0.3},
+    {"learning_rate":0.05, "n_estimators":600, "num_leaves":31, "max_depth":4, "min_data_in_leaf":20, "lambda_l2":0.1},
+]
+
+def normalize_params(params):
+    p = params.copy()
+    # LightGBM sklearn API でのパラメータ名に合わせる
+    if "lambda_l2" in p:
+        p["reg_lambda"] = p.pop("lambda_l2")
+    if "min_data_in_leaf" in p:
+        p["min_child_samples"] = p.pop("min_data_in_leaf")
+    # reduce logging noise and use all cores
+    p.setdefault("verbosity", -1)
+    p.setdefault("n_jobs", -1)
+    return p
+
+results = []
+for params in param_grid:
+    params_norm = normalize_params(params)
+    scores = []
+    for tr_idx, va_idx in cv.split(X, y):
+        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+        model = LGBMClassifier(
+            random_state=42,
+            **params_norm
+        )
+        # verbose を False にして出力を抑制
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], eval_metric="auc")
+        preds_va = model.predict_proba(X_va)[:,1]
+        scores.append(roc_auc_score(y_va, preds_va))
+    results.append((params, np.mean(scores)))
+
+# ベストパラメータ選択
+best_params, best_cv = sorted(results, key=lambda x: x[1], reverse=True)[0]
+print("Best CV AUC:", best_cv, "Params:", best_params)
+
+# ベストで全学習→テスト予測
+best_params_norm = normalize_params(best_params)
+best_model = LGBMClassifier(random_state=42, **best_params_norm)
+best_model.fit(X, y)
+if X_test is not None:
+    test_preds = best_model.predict_proba(X_test)[:,1]
+    # フォーマット要件: 1列目=id, 2列目=生存確率、ヘッダ無しのCSV
+    if "id" in test.columns:
+        ids = test["id"]
+    elif "PassengerId" in test.columns:
+        ids = test["PassengerId"]
+    else:
+        # 最悪、インデックスを id として使う
+        ids = test.index.to_series().reset_index(drop=True)
+
+    sub = pd.DataFrame({"id": ids.values, "survived": test_preds})
+    out_path = script_dir / "submission.csv"
+    # ヘッダ無しで保存（評価フォーマット準拠）
+    sub.to_csv(out_path, header=False, index=False)
+    print(f"Saved predictions to: {out_path} (headerless id,prob)")
+else:
+    test_preds = None
+import numpy as np
+import pandas as pd
+from pathlib import Path
 import lightgbm as lgb
 from lightgbm import LGBMClassifier
 import optuna
@@ -46,231 +203,205 @@ core_features = [
 def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # embarked one-hot (embarked_S, embarked_C, embarked_Q)
-    if "embarked" in df.columns:
-        d = pd.get_dummies(df["embarked"], prefix="embarked")
-        for col in ("embarked_S", "embarked_C", "embarked_Q"):
-            if col not in d.columns:
-                d[col] = 0
-        df = pd.concat([df, d[["embarked_S", "embarked_C", "embarked_Q"]]], axis=1)
+    import numpy as np
+    import pandas as pd
+    from pathlib import Path
+    from lightgbm import LGBMClassifier
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import roc_auc_score
 
-    # family_size = sibsp + parch + 1
-    if "family_size" not in df.columns and all(c in df.columns for c in ("sibsp", "parch")):
-        df["family_size"] = df["sibsp"].fillna(0) + df["parch"].fillna(0) + 1
+    # train / test がグローバルに無ければ csv または parquet を同ディレクトリから探す
+    try:
+        train  # type: ignore
+        test   # type: ignore
+    except NameError:
+        script_dir = Path(__file__).resolve().parent
+        def load_candidate(name_stems):
+            for stem in name_stems:
+                for ext in (".csv", ".parquet", ".pkl"):
+                    p = script_dir / (stem + ext)
+                    if p.exists():
+                        if ext == ".csv":
+                            return pd.read_csv(p)
+                        elif ext == ".parquet":
+                            return pd.read_parquet(p)
+                        else:
+                            return pd.read_pickle(p)
+            return None
 
-    # fare_per_person = fare / family_size (fallback to fare if family_size missing)
-    if "fare_per_person" not in df.columns and "fare" in df.columns:
-        if "family_size" in df.columns:
-            df["fare_per_person"] = df["fare"].fillna(0) / df["family_size"].clip(lower=1)
-        else:
-            df["fare_per_person"] = df["fare"].fillna(0)
+        train = load_candidate(["train", "train_data", "train_df"])
+        test = load_candidate(["test", "test_data", "test_df"])
 
-    # age_group: simple bucketing from age
-    if "age_group" not in df.columns and "age" in df.columns:
-        bins = [0, 12, 18, 35, 60, 120]
-        labels = ["child", "teen", "young_adult", "adult", "senior"]
-        df["age_group"] = pd.cut(df["age"].fillna(-1), bins=bins, labels=labels, include_lowest=True)
-        # convert to numeric codes so models won't choke on strings
-        df["age_group"] = df["age_group"].astype("category").cat.codes
+        if train is None or test is None:
+            raise RuntimeError(
+                "train/test が見つかりません。スクリプトの同ディレクトリに train.csv/test.csv などを置くか、"
+                "先に train/test DataFrame を定義してください。"
+            )
 
-    # convert any remaining object dtype core features to categorical codes
-    for col in list(df.columns):
-        if col in core_features and df[col].dtype == object:
-            df[col] = df[col].astype('category').cat.codes
+    # 残す特徴のみ選択
+    core_features = [
+        "pclass","sex","age","sibsp","parch","fare",
+        "embarked_S","embarked_C","embarked_Q",
+        "family_size","fare_per_person","age_group"
+    ]
+    def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # embarked one-hot (embarked_S, embarked_C, embarked_Q)
+        if "embarked" in df.columns:
+            d = pd.get_dummies(df["embarked"], prefix="embarked")
+            for col in ("embarked_S", "embarked_C", "embarked_Q"):
+                if col not in d.columns:
+                    d[col] = 0
+            df = pd.concat([df, d[["embarked_S", "embarked_C", "embarked_Q"]]], axis=1)
 
-    # additional robust features
-    # is_alone
-    if "family_size" in df.columns and "is_alone" not in df.columns:
-        df["is_alone"] = (df["family_size"] == 1).astype(int)
+        # family_size = sibsp + parch + 1
+        if "family_size" not in df.columns and all(c in df.columns for c in ("sibsp", "parch")):
+            df["family_size"] = df["sibsp"].fillna(0) + df["parch"].fillna(0) + 1
 
-    # fare_log
-    if "fare" in df.columns and "fare_log" not in df.columns:
-        df["fare_log"] = np.log1p(df["fare"].fillna(0))
+        # fare_per_person = fare / family_size (fallback to fare if family_size missing)        
+        if "fare_per_person" not in df.columns and "fare" in df.columns:
+            if "family_size" in df.columns:
+                df["fare_per_person"] = df["fare"].fillna(0) / df["family_size"].clip(lower=1)  
+            else:
+                df["fare_per_person"] = df["fare"].fillna(0)
 
-    # age_na flag and simple imputation (median)
-    if "age" in df.columns:
-        if "age_na" not in df.columns:
-            df["age_na"] = df["age"].isna().astype(int)
-        if df["age"].isna().any():
-            median_age = df["age"].median()
-            df["age"] = df["age"].fillna(median_age)
+        # age_group: simple bucketing from age
+        if "age_group" not in df.columns and "age" in df.columns:
+            bins = [0, 12, 18, 35, 60, 120]
+            labels = ["child", "teen", "young_adult", "adult", "senior"]
+            df["age_group"] = pd.cut(df["age"].fillna(-1), bins=bins, labels=labels, include_lowest=True)
+            # convert to numeric codes so models won't choke on strings
+            df["age_group"] = df["age_group"].astype("category").cat.codes
 
-    # title extraction from Name if present
-    if "Name" in df.columns and "title" not in df.columns:
-        # extract the title in form 'Last, Title. First'
-        titles = df["Name"].astype(str).str.extract(r",\s*([^\.]+)\.")
-        df["title"] = titles[0].fillna("Unknown").str.strip()
-        # group rare titles
-        common = df["title"].value_counts().nlargest(10).index
-        df["title"] = df["title"].where(df["title"].isin(common), other="Rare")
-        df["title"] = df["title"].astype("category").cat.codes
+        # convert any remaining object dtype core features to categorical codes
+        for col in list(df.columns):
+            if col in core_features and df[col].dtype == object:
+                df[col] = df[col].astype('category').cat.codes
 
-    return df
-
-    return df
-
-
-# try to create missing engineered features in both train/test when possible
-train = _ensure_features(train)
-test = _ensure_features(test)
-
-# choose only features that actually exist
-available_features = [f for f in core_features if f in train.columns]
-# include additional features if present
-for extra in ("is_alone", "fare_log", "age_na", "title"):
-    if extra in train.columns and extra not in available_features:
-        available_features.append(extra)
-
-missing = [f for f in core_features if f not in train.columns]
-if missing:
-    print("Warning: following core features missing from train and will be skipped:", missing)
-
-X = train[available_features].copy()
-y = train["survived"].copy()
-X_test = test[available_features].copy() if all(f in test.columns for f in available_features) else None
-
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-# 軽いグリッド（組み合わせは最小限）
-param_grid = [
-    {"learning_rate":0.03, "n_estimators":800, "num_leaves":31, "max_depth":5, "min_data_in_leaf":25, "lambda_l2":0.2},
-    {"learning_rate":0.01, "n_estimators":1200, "num_leaves":15, "max_depth":5, "min_data_in_leaf":30, "lambda_l2":0.3},
-    {"learning_rate":0.05, "n_estimators":600, "num_leaves":31, "max_depth":4, "min_data_in_leaf":20, "lambda_l2":0.1},
-]
-
-def normalize_params(params):
-    p = params.copy()
-    # LightGBM sklearn API でのパラメータ名に合わせる
-    if "lambda_l2" in p:
-        p["reg_lambda"] = p.pop("lambda_l2")
-    if "min_data_in_leaf" in p:
-        p["min_child_samples"] = p.pop("min_data_in_leaf")
-    # reduce logging noise and use all cores
-    p.setdefault("verbosity", -1)
-    p.setdefault("n_jobs", -1)
-    return p
-
-results = []
-for params in param_grid:
-    params_norm = normalize_params(params)
-    scores = []
-    for tr_idx, va_idx in cv.split(X, y):
-        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
-        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-        model = LGBMClassifier(
-            random_state=42,
-            **params_norm
-        )
-        # use early stopping to speed up trials and avoid overfitting
-        model.fit(
-            X_tr,
-            y_tr,
-            eval_set=[(X_va, y_va)],
-            eval_metric="auc",
-            callbacks=[lgb.early_stopping(100)],
-        )
-        preds_va = model.predict_proba(X_va)[:,1]
-        scores.append(roc_auc_score(y_va, preds_va))
-    print(f"Params: {params} -> fold AUCs: {scores} mean: {np.mean(scores):.6f}")
-    results.append((params, np.mean(scores)))
-
-# ベストパラメータ選択
-best_params, best_cv = sorted(results, key=lambda x: x[1], reverse=True)[0]
-print("Best CV AUC:", best_cv, "Params:", best_params)
-
-# ベストで全学習→テスト予測
-best_params_norm = normalize_params(best_params)
-best_model = LGBMClassifier(random_state=42, **best_params_norm)
-best_model.fit(X, y)
-if X_test is not None:
-    test_preds = best_model.predict_proba(X_test)[:,1]
-    # フォーマット要件: 1列目=id, 2列目=生存確率、ヘッダ無しのCSV
-    if "id" in test.columns:
-        ids = test["id"]
-    elif "PassengerId" in test.columns:
-        ids = test["PassengerId"]
-    else:
-        # 最悪、インデックスを id として使う
-        ids = test.index.to_series().reset_index(drop=True)
-
-    sub = pd.DataFrame({"id": ids.values, "survived": test_preds})
-    out_path = script_dir / "submission.csv"
-    # ヘッダ無しで保存（評価フォーマット準拠）
-    sub.to_csv(out_path, header=False, index=False)
-    print(f"Saved predictions to: {out_path} (headerless id,prob)")
-else:
-    test_preds = None
+        return df
 
 
-# --- Optuna tuning (run after grid search) ---------------------------------
-def run_optuna(n_trials: int = 100, study_name: str = "lgbm_opt"):
-    def objective(trial: optuna.Trial):
-        params = {
-            "learning_rate": trial.suggest_loguniform("learning_rate", 1e-3, 1e-1),
-            "n_estimators": trial.suggest_int("n_estimators", 200, 2000),
-            "num_leaves": trial.suggest_int("num_leaves", 7, 127),
-            "max_depth": trial.suggest_int("max_depth", 3, 12),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 5, 100),
-            "lambda_l2": trial.suggest_loguniform("lambda_l2", 1e-8, 10.0),
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
-        }
+    # try to create missing engineered features in both train/test when possible
+    train = _ensure_features(train)
+    test = _ensure_features(test)
+
+    # choose only features that actually exist
+    available_features = [f for f in core_features if f in train.columns]
+    missing = [f for f in core_features if f not in train.columns]
+    if missing:
+        print("Warning: following core features missing from train and will be skipped:", missin
+    g)                                                                                          
+    X = train[available_features].copy()
+    y = train["survived"].copy()
+    X_test = test[available_features].copy() if all(f in test.columns for f in available_feature
+    s) else None                                                                                
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    # 軽いグリッド（組み合わせは最小限）
+    param_grid = [
+        {"learning_rate":0.03, "n_estimators":800, "num_leaves":31, "max_depth":5, "min_data_in_
+    leaf":25, "lambda_l2":0.2},                                                                     {"learning_rate":0.01, "n_estimators":1200, "num_leaves":15, "max_depth":5, "min_data_in
+    _leaf":30, "lambda_l2":0.3},                                                                    {"learning_rate":0.05, "n_estimators":600, "num_leaves":31, "max_depth":4, "min_data_in_
+    leaf":20, "lambda_l2":0.1},                                                                 ]
+
+    def normalize_params(params):
+        p = params.copy()
+        # LightGBM sklearn API でのパラメータ名に合わせる
+        if "lambda_l2" in p:
+            p["reg_lambda"] = p.pop("lambda_l2")
+        if "min_data_in_leaf" in p:
+            p["min_child_samples"] = p.pop("min_data_in_leaf")
+        # reduce logging noise and use all cores
+        p.setdefault("verbosity", -1)
+        p.setdefault("n_jobs", -1)
+        return p
+
+    results = []
+    for params in param_grid:
         params_norm = normalize_params(params)
-        fold_scores = []
+        scores = []
         for tr_idx, va_idx in cv.split(X, y):
             X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
             y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-            model = LGBMClassifier(random_state=42, **params_norm)
-            model.fit(
-                X_tr,
-                y_tr,
-                eval_set=[(X_va, y_va)],
-                eval_metric="auc",
-                callbacks=[lgb.early_stopping(50)],
-            )
-            preds_va = model.predict_proba(X_va)[:, 1]
-            fold_scores.append(roc_auc_score(y_va, preds_va))
-        mean_score = float(np.mean(fold_scores))
-        trial.report(mean_score, step=0)
-        return mean_score
-
-    sampler = TPESampler(seed=42)
-    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=1)
-    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner, study_name=study_name)
-    study.optimize(objective, n_trials=n_trials, n_jobs=1)
-
-    print("Optuna best value:", study.best_value)
-    print("Optuna best params:", study.best_params)
-    df = study.trials_dataframe()
-    df.to_csv(script_dir / "optuna_trials.csv", index=False)
-    return study
+            model = LGBMClassifier(
+                return df
 
 
-# Run Optuna tuning now (default 100 trials)
-try:
-    study = run_optuna(n_trials=100)
-except Exception as e:
-    print("Optuna tuning failed:", e)
+            # try to create missing engineered features in both train/test when possible
+            train = _ensure_features(train)
+            test = _ensure_features(test)
 
+            # choose only features that actually exist
+            available_features = [f for f in core_features if f in train.columns]
+            missing = [f for f in core_features if f not in train.columns]
+            if missing:
+                print("Warning: following core features missing from train and will be skipped:", missing)
 
-# If Optuna produced a study, retrain on full data with the best params and overwrite submission.csv
-if 'study' in locals() and getattr(study, 'best_params', None) is not None:
-    try:
-        best_opt_params = study.best_params
-        best_opt_norm = normalize_params(best_opt_params)
-        print("Retraining final model on full data with Optuna best params:", best_opt_params)
-        final_model = LGBMClassifier(random_state=42, **best_opt_norm)
-        final_model.fit(X, y)
-        if X_test is not None:
-            final_preds = final_model.predict_proba(X_test)[:, 1]
-            if "id" in test.columns:
-                ids = test["id"]
-            elif "PassengerId" in test.columns:
-                ids = test["PassengerId"]
+            X = train[available_features].copy()
+            y = train["survived"].copy()
+            X_test = test[available_features].copy() if all(f in test.columns for f in available_features) else None
+
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+            # 軽いグリッド（組み合わせは最小限）
+            param_grid = [
+                {"learning_rate": 0.03, "n_estimators": 800, "num_leaves": 31, "max_depth": 5, "min_data_in_leaf": 25, "lambda_l2": 0.2},
+                {"learning_rate": 0.01, "n_estimators": 1200, "num_leaves": 15, "max_depth": 5, "min_data_in_leaf": 30, "lambda_l2": 0.3},
+                {"learning_rate": 0.05, "n_estimators": 600, "num_leaves": 31, "max_depth": 4, "min_data_in_leaf": 20, "lambda_l2": 0.1},
+            ]
+
+            def normalize_params(params):
+                p = params.copy()
+                # LightGBM sklearn API でのパラメータ名に合わせる
+                if "lambda_l2" in p:
+                    p["reg_lambda"] = p.pop("lambda_l2")
+                if "min_data_in_leaf" in p:
+                    p["min_child_samples"] = p.pop("min_data_in_leaf")
+                # reduce logging noise and use all cores
+                p.setdefault("verbosity", -1)
+                p.setdefault("n_jobs", -1)
+                return p
+
+            results = []
+            for params in param_grid:
+                params_norm = normalize_params(params)
+                scores = []
+                for tr_idx, va_idx in cv.split(X, y):
+                    X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+                    y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+                    model = LGBMClassifier(
+                        random_state=42,
+                        **params_norm
+                    )
+                    # verbose を False にして出力を抑制
+                    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], eval_metric="auc")
+                    preds_va = model.predict_proba(X_va)[:,1]
+                    scores.append(roc_auc_score(y_va, preds_va))
+                results.append((params, np.mean(scores)))
+
+            # ベストパラメータ選択
+            best_params, best_cv = sorted(results, key=lambda x: x[1], reverse=True)[0]
+            print("Best CV AUC:", best_cv, "Params:", best_params)
+
+            # ベストで全学習→テスト予測
+            best_params_norm = normalize_params(best_params)
+            best_model = LGBMClassifier(random_state=42, **best_params_norm)
+            best_model.fit(X, y)
+            if X_test is not None:
+                test_preds = best_model.predict_proba(X_test)[:,1]
+                # フォーマット要件: 1列目=id, 2列目=生存確率、ヘッダ無しのCSV
+                if "id" in test.columns:
+                    ids = test["id"]
+                elif "PassengerId" in test.columns:
+                    ids = test["PassengerId"]
+                else:
+                    # 最悪、インデックスを id として使う
+                    ids = test.index.to_series().reset_index(drop=True)
+
+                sub = pd.DataFrame({"id": ids.values, "survived": test_preds})
+                out_path = script_dir / "submission.csv"
+                # ヘッダ無しで保存（評価フォーマット準拠）
+                sub.to_csv(out_path, header=False, index=False)
+                print(f"Saved predictions to: {out_path} (headerless id,prob)")
             else:
-                ids = test.index.to_series().reset_index(drop=True)
-            sub = pd.DataFrame({"id": ids.values, "survived": final_preds})
-            out_path = script_dir / "submission.csv"
-            sub.to_csv(out_path, header=False, index=False)
-            print(f"Optuna-final predictions saved to: {out_path} (headerless id,prob)")
-    except Exception as e:
-        print("Failed to retrain/predict with Optuna best params:", e)
+                test_preds = None
