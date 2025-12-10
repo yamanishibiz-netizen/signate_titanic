@@ -1,123 +1,94 @@
-import os
+import numpy as np
 import pandas as pd
+import os
+from pathlib import Path
 from lightgbm import LGBMClassifier
-from sklearn.model_selection import train_test_split
 
 # スクリプトファイルのあるディレクトリを基準にデータを読む
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = Path(__file__).resolve().parent
+train = pd.read_csv(BASE_DIR / "train.csv")
+test = pd.read_csv(BASE_DIR / "test.csv")
 
-# データ読み込み
-train = pd.read_csv(os.path.join(BASE_DIR, "train.csv"))
-test = pd.read_csv(os.path.join(BASE_DIR, "test.csv"))
+# 残す特徴のみ選択
+core_features = [
+    "pclass","sex","age","sibsp","parch","fare",
+    "embarked_S","embarked_C","embarked_Q",
+    "family_size","fare_per_person","age_group"
+]
 
-# sexを数値化
-train["sex"] = train["sex"].map({"male": 0, "female": 1})
-test["sex"] = test["sex"].map({"male": 0, "female": 1})
+def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # embarked one-hot
+    if "embarked" in df.columns:
+        d = pd.get_dummies(df["embarked"], prefix="embarked")
+        for col in ("embarked_S", "embarked_C", "embarked_Q"):
+            if col not in d.columns:
+                d[col] = 0
+        df = pd.concat([df, d[["embarked_S","embarked_C","embarked_Q"]]], axis=1)
 
-# embarked補完
-for df in [train, test]:
-    df["embarked"].fillna(df["embarked"].mode()[0], inplace=True)
+    # family_size
+    if "family_size" not in df.columns and all(c in df.columns for c in ("sibsp","parch")):
+        df["family_size"] = df["sibsp"].fillna(0) + df["parch"].fillna(0) + 1
 
-# age補完
-for df in [train, test]:
-    df["age"] = df.groupby(["pclass", "sex"])["age"].transform(lambda x: x.fillna(x.median()))
+    # fare_per_person
+    if "fare_per_person" not in df.columns and "fare" in df.columns:
+        if "family_size" in df.columns:
+            df["fare_per_person"] = df["fare"].fillna(0) / df["family_size"].clip(lower=1)
+        else:
+            df["fare_per_person"] = df["fare"].fillna(0)
 
-# fare補完
-for df in [train, test]:
-    df["fare"] = df.groupby(["pclass", "embarked"])["fare"].transform(lambda x: x.fillna(x.median()))
+    # age_group
+    if "age_group" not in df.columns and "age" in df.columns:
+        bins = [0,12,18,35,60,120]
+        labels = ["child","teen","young_adult","adult","senior"]
+        df["age_group"] = pd.cut(df["age"].fillna(-1), bins=bins, labels=labels, include_lowest=True)
+        df["age_group"] = df["age_group"].astype("category").cat.codes
 
-# embarkedをOne-Hot化
-train = pd.get_dummies(train, columns=["embarked"], prefix="embarked")
-test = pd.get_dummies(test, columns=["embarked"], prefix="embarked")
+    # object型をカテゴリコード化
+    for col in list(df.columns):
+        if col in core_features and df[col].dtype == object:
+            df[col] = df[col].astype("category").cat.codes
 
-# 🔹追加特徴量
-train["family_size"] = train["sibsp"] + train["parch"] + 1
-test["family_size"] = test["sibsp"] + test["parch"] + 1
+    return df
 
-train["fare_per_person"] = train["fare"] / train["family_size"]
-test["fare_per_person"] = test["fare"] / test["family_size"]
+# 特徴量生成
+train = _ensure_features(train)
+test = _ensure_features(test)
 
-train["is_alone"] = (train["family_size"] == 1).astype(int)
-test["is_alone"] = (test["family_size"] == 1).astype(int)
+# 使用する特徴量
+features = [f for f in core_features if f in train.columns]
+X = train[features].copy()
+y = train["survived"].copy()
+X_test = test[features].copy()
 
-train["age_group"] = pd.cut(train["age"], bins=[0,12,18,60,100], labels=[0,1,2,3])
-test["age_group"] = pd.cut(test["age"], bins=[0,12,18,60,100], labels=[0,1,2,3])
+# CVで得られたベストパラメータを反映
+best_params = {
+    "learning_rate":0.03,
+    "n_estimators":800,
+    "num_leaves":31,
+    "max_depth":5,
+    "min_child_samples":25,
+    "reg_lambda":0.2,
+    "verbosity":-1,
+    "n_jobs":-1,
+    "random_state":42
+}
 
-# age_group を数値化して欠損を埋める
-train["age_group"] = train["age_group"].astype(float).fillna(-1).astype(int)
-test["age_group"] = test["age_group"].astype(float).fillna(-1).astype(int)
-
-# 敬称抽出（`name` 列がある場合のみ抽出、なければプレースホルダを作成）
-if "name" in train.columns and "name" in test.columns:
-    train["title"] = train["name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
-    test["title"] = test["name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
-
-    for df in [train, test]:
-        df["title"] = df["title"].replace(["Mlle","Ms"], "Miss").replace(["Mme"], "Mrs")
-        df["title"] = df["title"].replace(
-            ["Dr","Rev","Col","Major","Capt","Countess","Lady","Sir","Jonkheer","Don"], "Rare"
-        )
-else:
-    # `name` がないデータセット向けに汎用ラベルを付与してダミー化可能にする
-    train["title"] = "NoName"
-    test["title"] = "NoName"
-
-train = pd.get_dummies(train, columns=["title"], prefix="title")
-test = pd.get_dummies(test, columns=["title"], prefix="title")
-
-# キャビン頭文字（`cabin` 列がある場合は先頭文字を使い、無ければ 'U' を使う）
-if "cabin" in train.columns:
-    train["cabin_initial"] = train["cabin"].fillna("U").str[0]
-else:
-    train["cabin_initial"] = "U"
-
-if "cabin" in test.columns:
-    test["cabin_initial"] = test["cabin"].fillna("U").str[0]
-else:
-    test["cabin_initial"] = "U"
-
-train = pd.get_dummies(train, columns=["cabin_initial"], prefix="cabin")
-test = pd.get_dummies(test, columns=["cabin_initial"], prefix="cabin")
-
-# --- 重要: train と test のダミー列を揃える ---
-# train にあって test にない列は 0 を埋める。逆も同様に行う。
-for col in train.columns:
-    if col not in test.columns and col not in ["survived", "name", "ticket", "cabin"]:
-        test[col] = 0
-for col in test.columns:
-    if col not in train.columns:
-        # survived は train 側にしかないため追加は不要だが
-        # モデル学習や列揃えのため 0 を埋める
-        train[col] = 0
-
-# 特徴量選択
-features = [col for col in train.columns if col not in ["survived","name","ticket","cabin"]]
-X = train[features]
-y = train["survived"]
-X_test = test[features]
-
-# train/valid分割
-X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
-# LightGBMモデル
-model = LGBMClassifier(
-    n_estimators=500,
-    learning_rate=0.05,
-    num_leaves=31,
-    random_state=42
-)
-
-model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], eval_metric="auc")
+# モデル学習
+model = LGBMClassifier(**best_params)
+model.fit(X, y)
 
 # 予測
 preds = model.predict_proba(X_test)[:,1]
 
-# 提出ファイル作成（ヘッダなし2列）
-# テストデータのID列名はデータセットにより異なるためフォールバックを用意
-id_col = "id" if "id" in test.columns else ("PassengerId" if "PassengerId" in test.columns else None)
-if id_col is None:
-    # 最後の手段として最初の列をID扱い
-    id_col = test.columns[0]
+# 提出ファイル作成
+if "id" in test.columns:
+    ids = test["id"]
+elif "PassengerId" in test.columns:
+    ids = test["PassengerId"]
+else:
+    ids = test.index.to_series().reset_index(drop=True)
 
-submission = pd.DataFrame({"id": test[id_col], "survived": preds})
-submission.to_csv(os.path.join(BASE_DIR, "submission.csv"), index=False, header=False)
+submission = pd.DataFrame({"id": ids.values, "survived": preds})
+submission.to_csv(BASE_DIR / "submission.csv", header=False, index=False)
+print("Saved submission.csv")
